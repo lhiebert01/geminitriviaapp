@@ -1,0 +1,14 @@
+# Core dependencies
+streamlit
+openai
+python-dotenv
+
+# Google Sheets integration
+gspread
+oauth2client
+Pillow
+
+# Additional utilities
+requests
+
+google-generativeai
