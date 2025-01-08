@@ -9,16 +9,23 @@ A trivia game powered by Google's Gemini AI model that:
 
 import streamlit as st
 import google.generativeai as genai
+import time
 import google.ai.generativelanguage as glm
 import gspread
 from oauth2client.service_account import ServiceAccountCredentials
 from dotenv import load_dotenv
 import os
-import time
 import json
+import random
 
 import atexit
 import grpc
+import logging
+
+os.environ['GRPC_ENABLE_FORK_SUPPORT'] = '0'
+os.environ['GRPC_DNS_RESOLVER'] = 'native'
+logging.getLogger('absl').setLevel(logging.ERROR)
+
 
 # Initialize GEMINI client using environment variable or Streamlit secrets
 def get_gemini_key():
@@ -30,7 +37,9 @@ def get_gemini_key():
 
 # Initialize Gemini
 genai.configure(api_key=get_gemini_key())
-model = genai.GenerativeModel('gemini-1.5-pro-latest')
+model = genai.GenerativeModel('gemini-1.5-flash')
+
+
 
 # Set page configuration
 st.set_page_config(
@@ -171,37 +180,79 @@ st.markdown("""
     </style>
 """, unsafe_allow_html=True)
 
+# Initialize all required session state variables
+def initialize_session_state():
+    """Initialize all required session state variables for the trivia game"""
+    
+    # Player and Game State
+    if 'player_name' not in st.session_state:
+        st.session_state.player_name = ""
+    if 'topic' not in st.session_state:
+        st.session_state.topic = ""
+    if 'questions_asked' not in st.session_state:
+        st.session_state.questions_asked = 0
+    if 'total_score' not in st.session_state:
+        st.session_state.total_score = 0
+    if 'game_length' not in st.session_state:
+        st.session_state.game_length = 10
+    if 'game_active' not in st.session_state:
+        st.session_state.game_active = False
+        
+    # Question Management
+    if 'current_question' not in st.session_state:
+        st.session_state.current_question = None
+    if 'answer_selected' not in st.session_state:
+        st.session_state.answer_selected = False
+    if 'feedback' not in st.session_state:
+        st.session_state.feedback = None
+    if 'question_cache' not in st.session_state:
+        st.session_state.question_cache = set()
+        
+    # Question History and Tracking
+    if 'question_history' not in st.session_state:
+        st.session_state.question_history = {
+            'questions': [],    # Track question metadata
+            'concepts': set(),  # Track used concepts
+            'domains_used': [] # Track used knowledge domains
+        }
+        
+    # Leaderboard Management
+    if 'leaderboard_cache' not in st.session_state:
+        st.session_state.leaderboard_cache = None
+    if 'last_sheet_load' not in st.session_state:
+        st.session_state.last_sheet_load = None
+    if 'sheet_object' not in st.session_state:
+        st.session_state.sheet_object = None
 
-# Initialize session state
-if 'player_name' not in st.session_state:
-    st.session_state.player_name = ""
-if 'topic' not in st.session_state:
-    st.session_state.topic = ""
-if 'questions_asked' not in st.session_state:
+# Call this at the start of your app
+
+    
+    
+
+# Update reset_game_state function to handle question history
+
+def reset_game_state():
+    """Reset game state for a new game"""
     st.session_state.questions_asked = 0
-if 'total_score' not in st.session_state:
     st.session_state.total_score = 0
-if 'current_question' not in st.session_state:
     st.session_state.current_question = None
-if 'game_active' not in st.session_state:
-    st.session_state.game_active = False
-if 'answer_selected' not in st.session_state:
     st.session_state.answer_selected = False
-if 'feedback' not in st.session_state:
     st.session_state.feedback = None
-if 'game_length' not in st.session_state:
-    st.session_state.game_length = 10
-# Add this to your session state initializations
-if 'leaderboard_cache' not in st.session_state:
-    st.session_state.leaderboard_cache = None
-if 'last_sheet_load' not in st.session_state:
-    st.session_state.last_sheet_load = None
-# other session state initializations
-if 'sheet_object' not in st.session_state:
-    st.session_state.sheet_object = None
-# Add to session state initialization section:
-if 'question_cache' not in st.session_state:
+    st.session_state.game_active = False
+    
+    # Clear question history but maintain structure
+    st.session_state.question_history = {
+        'questions': [],
+        'concepts': set(),
+        'domains_used': []
+    }
+    
+    # Clear caches
     st.session_state.question_cache = set()
+    st.session_state.leaderboard_cache = None
+    st.session_state.last_sheet_load = None
+
+    
 
 def load_and_resize_image(image_path, width=None, max_size=None):
     """Load an image and resize it with maximum dimensions"""
@@ -638,37 +689,82 @@ def display_leaderboards():
 
 
 def generate_trivia_question(topic):
-    """Generate a unique trivia question based on the topic using Gemini"""
+    """Generate engaging, mentor-style trivia questions that build knowledge progressively"""
     
-    prompt = f"""Create a concise but challenging trivia question about {topic}.
+    # Initialize question difficulty based on questions asked
+    question_number = st.session_state.questions_asked + 1
+    game_length = st.session_state.game_length
+    position = question_number / game_length
+    
+    # Determine question type
+    if position <= 0.2:
+        difficulty = "Insightful"
+    elif position <= 0.4:
+        difficulty = "Fun"
+    elif position <= 0.6:
+        difficulty = "Practical"
+    elif position <= 0.8:
+        difficulty = "Educational"
+    else:
+        difficulty = "Advanced"
+    
+    # Knowledge domains
+    knowledge_domains = [
+        "Key Concepts",
+        "Example Problems",
+        "Surprising Facts",
+        "Examples of Use",
+        "Economic Value?",
+        "Why this Matters",
+        "Famous People",
+        "Myths and Misconceptions",
+        "History, Names, Events, People and Places",
+        "Scientific Principles, Formulas, and Experiments",
+        "Future Trends"
+    ]
+    
+    # Domain selection
+    used_domains = [q.get('domain') for q in st.session_state.question_history.get('questions', [])]
+    available_domains = [d for d in knowledge_domains if d not in used_domains[-3:]]
+    selected_domain = random.choice(available_domains if available_domains else knowledge_domains)
 
-    Requirements:
-    1. Question must be unique and specific to {topic}
-    2. Length: Question should be 2-4 sentences maximum
-    3. All answer choices must be:
-       - Distinctly different from each other
-       - Similar in length and complexity, and detailed
-       - Plausible but with only one and only one clearly correct answer
-    4. Fact check must be concise (max 3 sentences) and definitively prove the correct answer
+    # Construct prompt
+    prompt = f"""As an expert TRIVIA GAME SHOW HOST and and expert mentor, create ACCURATE, FACT-CHECKED fun and engaging {difficulty}-level question about {topic} 
+    focusing on example questions related to the topic requested by the {selected_domain} that people would LOVE to know about. Use Examples.  
     
-    CRITICAL: Each answer choice must be meaningfully different from the others.
-    
-    Format:
-    QUESTION: [Concise question about {topic}]
-    A) [Distinct answer]
-    B) [Distinct answer]
-    C) [Distinct answer]
-    D) [Distinct answer]
-    CORRECT: [A, B, C, or D]
-    FACT CHECK: [Brief verification of correct answer]"""
 
+    FORMAT YOUR RESPONSE EXACTLY AS FOLLOWS:
+
+    QUESTION: [One clear, concise question (1 sentence)]
+    A) [Brief answer]
+    B) [Brief answer]
+    C) [Brief answer]
+    D) [Brief answer]
+    CORRECT: [Just the letter: A, B, C, or D]
+    FACT_CHECK: [1-2 sentences explaining the correct answer with details]
+    KEY_CONCEPTS: [4-6 key terms defined if used in the question or answers]
+    DIFFICULTY: {difficulty}
+    DOMAIN: {selected_domain}
+
+    REQUIREMENTS:
+    - Question must be ONE or TWO CONCISE sentences and interesting and engaging
+    - Each answer choice must be ONE or TWO CONCISE SHORT sentences
+    - Focus on fascinating relevant information and insights people would want to know about
+    - Make it accessible and interesting to a broad general audience (not just experts)
+    - Include practical or surprising information
+    """
+
+    # Generation configuration
     generation_config = genai.types.GenerationConfig(
-        temperature=0.9,
-        top_p=0.9,
+        temperature=1.2,
+        top_p=0.7,
         top_k=40,
-        max_output_tokens=1024,
+        frequency_penalty=1.0,
+        presence_penalty=1.0,
+        max_output_tokens=1024
     )
 
+    # Safety settings
     safety_settings = [
         {
             "category": "HARM_CATEGORY_HARASSMENT",
@@ -688,92 +784,98 @@ def generate_trivia_question(topic):
         }
     ]
 
-    def generate_with_backoff(max_retries=3):
-        for attempt in range(max_retries):
-            try:
-                return model.generate_content(
-                    f"""You are a {topic} expert creating concise, accurate trivia questions. Focus on interesting but verifiable facts.
-
-                    {prompt}""",
-                    generation_config=generation_config,
-                    safety_settings=safety_settings
-                )
-            except Exception as e:
-                if "rate" in str(e).lower() and attempt < max_retries - 1:
-                    time.sleep(2 ** attempt)  # Exponential backoff
-                    continue
-                raise
-
-    max_attempts = 3
-    for attempt in range(max_attempts):
+    def parse_response(response_text):
+        """Parse the response into required format"""
         try:
-            response = generate_with_backoff()
-            
-            if not hasattr(response, 'text') or not response.text:
-                if attempt == max_attempts - 1:
-                    st.error("Received empty response from Gemini")
-                continue
-                
-            content = response.text.strip().split("\n")
+            lines = response_text.strip().split('\n')
             question = None
             choices = []
-            correct_answer = None
+            correct = None
             fact_check = None
             
-            for line in content:
+            for line in lines:
                 line = line.strip()
-                if line.startswith("QUESTION:"):
-                    question = line.replace("QUESTION:", "").strip()
-                elif line.startswith(("A)", "B)", "C)", "D)")):
+                if line.startswith('QUESTION:'):
+                    question = line.replace('QUESTION:', '').strip()
+                elif line.startswith(('A)', 'B)', 'C)', 'D)')):
                     choices.append(line)
-                elif line.startswith("CORRECT:"):
-                    correct_answer = line.replace("CORRECT:", "").strip()
-                elif line.startswith("FACT CHECK:"):
-                    fact_check = line.replace("FACT CHECK:", "").strip()
+                elif line.startswith('CORRECT:'):
+                    correct = line.replace('CORRECT:', '').strip()
+                elif line.startswith('FACT_CHECK:'):
+                    fact_check = line.replace('FACT_CHECK:', '').strip()
             
-            # Validate response format
-            if not all([question, len(choices) == 4, correct_answer, fact_check]):
-                if attempt == max_attempts - 1:
-                    st.error("Invalid question format received from Gemini")
+            if not all([
+                question,
+                len(choices) == 4,
+                correct in ['A', 'B', 'C', 'D'],
+                fact_check
+            ]):
+                return None
+
+            return {
+                "question": question,
+                "choices": choices,
+                "correct": correct,
+                "fact_check": fact_check,
+                "start_time": time.time()
+            }
+        except Exception as e:
+            print(f"Error parsing response: {str(e)}")
+            return None
+
+    # Question generation loop
+    max_attempts = 5
+    for attempt in range(max_attempts):
+        try:
+            # Generate response
+            response = model.generate_content(
+                prompt,
+                generation_config=generation_config,
+                safety_settings=safety_settings
+            )
+
+            if not hasattr(response, 'text') or not response.text:
                 continue
-                
-            # Create a unique key for the question
-            question_key = f"{topic}:{question}"
+
+            # Parse response
+            question_data = parse_response(response.text)
+            if not question_data:
+                if attempt == max_attempts - 1:
+                    st.error("Unable to generate a valid question")
+                continue
+
+            # Create unique key for question
+            question_key = f"{topic}:{question_data['question']}"
             
-            # Check if question is unique
+            # Check uniqueness
             if question_key in st.session_state.question_cache:
                 if attempt == max_attempts - 1:
                     st.error("Unable to generate a unique question")
                 continue
-                
-            # Validate answer choices are distinct
-            answer_texts = [c.split(")", 1)[1].strip().lower() for c in choices]
-            if len(set(answer_texts)) != 4:
-                if attempt == max_attempts - 1:
-                    st.error("Generated answers are not distinct")
-                continue
-                
+            
             # Add to cache
             st.session_state.question_cache.add(question_key)
             
-            return {
-                "question": question,
-                "choices": choices,
-                "correct": correct_answer,
-                "fact_check": fact_check,
-                "start_time": time.time()
-            }
-        except genai.types.generation_types.BlockedPromptException:
-            st.error("Unable to generate question due to content restrictions.")
-            return None
+            # Update question history
+            if 'questions' not in st.session_state.question_history:
+                st.session_state.question_history['questions'] = []
+            
+            st.session_state.question_history['questions'].append({
+                'domain': selected_domain,
+                'difficulty': difficulty
+            })
+
+            return question_data
+
         except Exception as e:
             if attempt == max_attempts - 1:
                 st.error(f"Error generating question: {str(e)}")
                 return None
-            time.sleep(1)
-            continue
-    
+            time.sleep(2 ** attempt)
+
     return None
+
+
 
 def calculate_score(time_remaining):
     """Calculate score based on remaining time"""
@@ -810,18 +912,6 @@ def check_answer(selected_answer):
     
     st.session_state.answer_selected = True
     return time_remaining
-
-def reset_game_state():
-    """Reset game state for a new game but preserve question cache"""
-    st.session_state.questions_asked = 0
-    st.session_state.total_score = 0
-    st.session_state.current_question = None
-    st.session_state.answer_selected = False
-    st.session_state.feedback = None
-    st.session_state.game_active = False
-    st.session_state.leaderboard_cache = None
-    st.session_state.last_sheet_load = None
-    # Note: We do NOT clear question_cache here
     
 def main():
     """Main function for the Gemini GenAI Trivia Challenge"""
@@ -1163,6 +1253,7 @@ atexit.register(cleanup)
 
 
 if __name__ == "__main__":
+    initialize_session_state()
     try:
         main()
     except Exception as e:
